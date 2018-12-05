@@ -30,7 +30,6 @@ use NFePHP\NFe\Factories\Contingency;
 use NFePHP\NFe\Factories\ContingencyNFe;
 use NFePHP\NFe\Factories\Header;
 use NFePHP\NFe\Factories\QRCode;
-use SoapHeader;
 
 class Tools
 {
@@ -108,7 +107,7 @@ class Tools
      * Version of layout
      * @var string
      */
-    protected $versao = '3.10';
+    protected $versao = '4.00';
     /**
      * urlPortal
      * Instância do WebService
@@ -167,10 +166,14 @@ class Tools
      * @var array
      */
     protected $availableVersions = [
-        '3.10' => 'PL_008i2',
         '4.00' => 'PL_009_V4'
     ];
-    
+    /**
+     * @var string
+     */
+    protected $typePerson = 'J';
+
+
     /**
      * Constructor
      * load configurations,
@@ -188,10 +191,10 @@ class Tools
         ).'/';
         //valid config json string
         $this->config = Config::validate($configJson);
-        
         $this->version($this->config->versao);
         $this->setEnvironmentTimeZone($this->config->siglaUF);
         $this->certificate = $certificate;
+        $this->typePerson = $this->getTypeOfPersonFromCertificate();
         $this->setEnvironment($this->config->tpAmb);
         $this->contingency = new Contingency();
         $this->soap = new SoapCurl($certificate);
@@ -205,6 +208,30 @@ class Tools
     public function setEnvironmentTimeZone($acronym)
     {
         date_default_timezone_set(TimeZoneByUF::get($acronym));
+    }
+    
+    /**
+     * Return J or F from existing type in ASN.1 certificate
+     * J - pessoa juridica (CNPJ)
+     * F - pessoa física (CPF)
+     * @return string
+     */
+    public function getTypeOfPersonFromCertificate()
+    {
+        $cnpj = $this->certificate->getCNPJ();
+        $type = 'J';
+        if (substr($cnpj, 0, 1) === 'N') {
+            //não é CNPJ, então verificar se é CPF
+            $cpf = $this->certificate->getCPF();
+            if (substr($cpf, 0, 1) !== 'N') {
+                $type = 'F';
+            } else {
+                //não foi localizado nem CNPJ e nem CPF esse certificado não é usável
+                //throw new RuntimeException('Faltam elementos CNPJ/CPF no certificado digital.');
+                $type = '';
+            }
+        }
+        return $type;
     }
     
     /**
@@ -442,7 +469,7 @@ class Tools
      * @param array $opt
      * @return array
      */
-    public function canonicalOptions($opt = [true,false,null,null])
+    public function canonicalOptions(array $opt = [true, false, null, null])
     {
         if (!empty($opt) && is_array($opt)) {
             $this->canonical = $opt;
@@ -454,82 +481,37 @@ class Tools
      * Assembles all the necessary parameters for soap communication
      * @param string $service
      * @param string $uf
-     * @param int $tpAmb
+     * @param int $tpAmb 1-Production or 2-Homologation
      * @param bool $ignoreContingency
+     * @throws RuntimeException
      * @return void
      */
-    protected function servico(
-        $service,
-        $uf,
-        $tpAmb,
-        $ignoreContingency = false
-    ) {
-        $ambiente = $tpAmb == 1 ? "producao" : "homologacao";
+    protected function servico($service, $uf, $tpAmb, $ignoreContingency = false)
+    {
         $webs = new Webservices($this->getXmlUrlPath());
         $sigla = $uf;
         if (!$ignoreContingency) {
             $contType = $this->contingency->type;
-            if (!empty($contType)
-                && ($contType == 'SVCRS' || $contType == 'SVCAN')
-            ) {
+            if (!empty($contType) && ($contType == 'SVCRS' || $contType == 'SVCAN')) {
                 $sigla = $contType;
             }
         }
-        $stdServ = $webs->get($sigla, $ambiente, $this->modelo);
-        if ($stdServ === false) {
-            throw new \RuntimeException(
-                "Nenhum serviço foi localizado para esta unidade "
-                . "da federação [$sigla], com o modelo [$this->modelo]."
-            );
-        }
+        $stdServ = $webs->get($sigla, $tpAmb, $this->modelo);
         if (empty($stdServ->$service->url)) {
-            throw new \RuntimeException(
-                "Este serviço [$service] não está disponivel para esta "
-                . "unidade da federação [$uf] ou para este modelo de Nota ["
-                . $this->modelo
-                ."]."
-            );
+            throw new \RuntimeException("Servico [$service] indisponivel UF [$uf] ou modelo [$this->modelo]");
         }
-        //recuperação do cUF
-        $this->urlcUF = $this->getcUF($uf);
+        $this->urlcUF = $this->getcUF($uf); //recuperação do cUF
         if ($this->urlcUF > 91) {
-            //foi solicitado dado de SVCRS ou SVCAN
-            $this->urlcUF = $this->getcUF($this->config->siglaUF);
+            $this->urlcUF = $this->getcUF($this->config->siglaUF); //foi solicitado dado de SVCRS ou SVCAN
         }
-        //recuperação da versão
-        $this->urlVersion = $stdServ->$service->version;
-        //recuperação da url do serviço
-        $this->urlService = $stdServ->$service->url;
-        //recuperação do método
-        $this->urlMethod = $stdServ->$service->method;
-        //recuperação da operação
-        $this->urlOperation = $stdServ->$service->operation;
-        //montagem do namespace do serviço
-        $this->urlNamespace = sprintf(
-            "%s/wsdl/%s",
-            $this->urlPortal,
-            $this->urlOperation
-        );
+        $this->urlVersion = $stdServ->$service->version; //recuperação da versão
+        $this->urlService = $stdServ->$service->url; //recuperação da url do serviço
+        $this->urlMethod = $stdServ->$service->method; //recuperação do método
+        $this->urlOperation = $stdServ->$service->operation; //recuperação da operação
+        $this->urlNamespace = sprintf("%s/wsdl/%s", $this->urlPortal, $this->urlOperation); //monta namespace
         //montagem do cabeçalho da comunicação SOAP
-        $this->urlHeader = Header::get(
-            $this->urlNamespace,
-            $this->urlcUF,
-            $this->urlVersion
-        );
-        $this->urlAction = "\""
-            . $this->urlNamespace
-            . "/"
-            . $this->urlMethod
-            . "\"";
-        //montagem do SOAP Header
-        //para versões posteriores a 3.10 não incluir o SoapHeader !!!!
-        if ($this->versao < '4.00') {
-            $this->objHeader = new SoapHeader(
-                $this->urlNamespace,
-                'nfeCabecMsg',
-                ['cUF' => $this->urlcUF, 'versaoDados' => $this->urlVersion]
-            );
-        }
+        $this->urlHeader = Header::get($this->urlNamespace, $this->urlcUF, $this->urlVersion);
+        $this->urlAction = "\"$this->urlNamespace/$this->urlMethod\"";
     }
     
     /**
@@ -559,8 +541,7 @@ class Tools
      */
     protected function getXmlUrlPath()
     {
-        $file = $this->pathwsfiles
-            . "wsnfe_".$this->versao."_mod55.xml";
+        $file = $this->pathwsfiles . "wsnfe_" . $this->versao . "_mod55.xml";
         if ($this->modelo == 65) {
             $file = str_replace('55', '65', $file);
         }
@@ -584,13 +565,13 @@ class Tools
         }
         $memmod = $this->modelo;
         $this->modelo = 65;
-        $uf = UFList::getUFByCode(
-            $dom->getElementsByTagName('cUF')->item(0)->nodeValue
-        );
+        $cUF = $dom->getElementsByTagName('cUF')->item(0)->nodeValue;
+        $tpAmb = $dom->getElementsByTagName('tpAmb')->item(0)->nodeValue;
+        $uf = UFList::getUFByCode($cUF);
         $this->servico(
             'NfeConsultaQR',
             $uf,
-            $dom->getElementsByTagName('tpAmb')->item(0)->nodeValue
+            $tpAmb
         );
         $signed = QRCode::putQRTag(
             $dom,
@@ -598,7 +579,7 @@ class Tools
             $this->config->CSCid,
             $this->urlVersion,
             $this->urlService,
-            $this->getURIConsultaNFCe($uf)
+            $this->getURIConsultaNFCe($uf, $tpAmb)
         );
         $this->modelo = $memmod;
         return Strings::clearXmlString($signed);
@@ -610,20 +591,15 @@ class Tools
      * @param string $uf
      * @return string
      */
-    protected function getURIConsultaNFCe($uf)
+    protected function getURIConsultaNFCe($uf, $tpAmb)
     {
-        if ($this->versao < '4.00') {
-            return '';
-        }
-        //essa TAG existe no XML apenas para layout >= 4.x
-        //os URI estão em storage/uri_consulta_nfce.json
         $arr = json_decode(
             file_get_contents(
                 $this->pathwsfiles.'uri_consulta_nfce.json'
             ),
             true
         );
-        $std = json_decode(json_encode($arr[$this->tpAmb]));
+        $std = json_decode(json_encode($arr[$tpAmb]));
         return $std->$uf;
     }
     
